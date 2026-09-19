@@ -44,7 +44,7 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
 const ROUTER_ADDRESS = "0xfe7bf2dfd5cb268c6779f1f614638a436cb701e4";
-const WSVP_ADDRESS = "0x5300000000000000000000000000000000000004";
+const WSVP_ADDRESS = "0x771a0a63D8198b7dbea4a16910ff68AB38006531";
 const TOKENS = {
     USDV: "0x013a61E622e6ABFCaB64F52D274C3Fc0aA37f951",
     WETH: "0x1c12dbda863900c680a3836c53d408feaf63f0ba",
@@ -82,10 +82,13 @@ const WSVP_ABI = [
 ];
 
 const routerContract = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, wallet);
-const wsvpContract = new ethers.Contract(WSVP_ADDRESS, WSVP_ABI, wallet);
 
-// Default base routing token (akan ditimpa secara otomatis oleh router)
+// Default base routing token (akan ditimpa secara otomatis oleh router.WETH())
 let ROUTER_WETH_ADDRESS = "0x1c12dbda863900c680a3836c53d408feaf63f0ba";
+// wsvpContract dibuat ULANG setelah alamat wrapped-native asli terdeteksi dari router,
+// karena WSVP_ADDRESS yang di-hardcode di atas TERBUKTI SALAH untuk chain ini
+// (tidak ada kontrak di sana - lihat verifyContractsExist()).
+let wsvpContract = new ethers.Contract(WSVP_ADDRESS, WSVP_ABI, wallet);
 
 // ==========================================
 // 3. FUNGSI UTILITAS & ANTI-SYBIL
@@ -253,6 +256,10 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
 }
 
 async function handleWsvp() {
+    if (!wsvpContract) {
+        console.log(`${getTime()} ${C.yellow}⚠️ Kontrak WSVP tidak tersedia, melewati wrap/unwrap.${C.reset}`);
+        return;
+    }
     try {
         const randomAmount = (Math.random() * (0.03 - 0.01) + 0.01).toFixed(4);
         const amountIn = ethers.parseEther(randomAmount.toString());
@@ -315,7 +322,6 @@ async function runDailyCycle(loopCount) {
 async function verifyContractsExist() {
     const addressesToCheck = {
         ROUTER: ROUTER_ADDRESS,
-        WSVP: WSVP_ADDRESS,
         ...TOKENS
     };
 
@@ -350,6 +356,25 @@ async function main() {
             console.log(`${getTime()} ${C.green}🔗 Terhubung. Base Route Terdeteksi: ${ROUTER_WETH_ADDRESS}${C.reset}\n`);
         } catch (e) {
             console.log(`${getTime()} ${C.yellow}⚠️ Gagal cek Router WETH, menggunakan default manual.${C.reset}\n`);
+        }
+
+        // Tentukan kontrak wrap/unwrap: prioritaskan WSVP_ADDRESS yang sudah ditentukan manual.
+        // Kalau alamat itu ternyata tidak berisi kontrak, baru fallback ke alamat wrapped-native
+        // hasil deteksi otomatis dari router.WETH().
+        const wsvpManualCode = await provider.getCode(WSVP_ADDRESS);
+        if (wsvpManualCode !== "0x" && wsvpManualCode !== "0x0") {
+            wsvpContract = new ethers.Contract(WSVP_ADDRESS, WSVP_ABI, wallet);
+            console.log(`${getTime()} ${C.green}🔧 Kontrak wrap/unwrap memakai alamat manual: ${WSVP_ADDRESS}${C.reset}\n`);
+        } else {
+            console.log(`${getTime()} ${C.yellow}⚠️ Alamat WSVP manual (${WSVP_ADDRESS}) tidak berisi kontrak.${C.reset}`);
+            const routerWethCode = await provider.getCode(ROUTER_WETH_ADDRESS);
+            if (routerWethCode !== "0x" && routerWethCode !== "0x0") {
+                wsvpContract = new ethers.Contract(ROUTER_WETH_ADDRESS, WSVP_ABI, wallet);
+                console.log(`${getTime()} ${C.green}🔧 Fallback: kontrak wrap/unwrap memakai alamat terdeteksi router: ${ROUTER_WETH_ADDRESS}${C.reset}\n`);
+            } else {
+                console.log(`${getTime()} ${C.red}❌ Kedua alamat WSVP tidak valid. Fitur wrap/unwrap (handleWsvp) akan dilewati.${C.reset}\n`);
+                wsvpContract = null;
+            }
         }
 
         const answer = await rl.question(`${C.bright}${C.cyan}[?] Berapa kali putaran rute transaksi per harinya? : ${C.reset}`);
