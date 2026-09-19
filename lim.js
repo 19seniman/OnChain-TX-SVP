@@ -110,12 +110,19 @@ function extractRevertReason(error) {
     return error?.message || 'Alasan tidak diketahui (revert tanpa pesan)';
 }
 
+const DEBUG = process.env.DEBUG === "1" || process.env.DEBUG === "true";
+
 // Simulasikan transaksi dulu (staticCall) sebelum benar-benar mengirimnya.
 // Ini penting supaya kalau bakal revert, kita tahu ALASANNYA dan tidak buang gas.
 async function simulateAndEstimate(contract, method, args, overrides = {}) {
     try {
         await contract[method].staticCall(...args, overrides);
     } catch (error) {
+        if (DEBUG) {
+            console.log(`${C.red}--- RAW ERROR (DEBUG) ---${C.reset}`);
+            console.log(JSON.stringify(error, Object.getOwnPropertyNames(error), 2));
+            console.log(`${C.red}-------------------------${C.reset}`);
+        }
         return { ok: false, reason: extractRevertReason(error) };
     }
 
@@ -304,9 +311,39 @@ async function runDailyCycle(loopCount) {
     console.log(`${C.red}⚠️  JANGAN TUTUP TERMINAL INI AGAR SCRIPT TETAP BERJALAN ⚠️${C.reset}`);
 }
 
+// Pastikan alamat-alamat penting benar-benar berisi kontrak (bukan salah alamat / EOA / jaringan salah)
+async function verifyContractsExist() {
+    const addressesToCheck = {
+        ROUTER: ROUTER_ADDRESS,
+        WSVP: WSVP_ADDRESS,
+        ...TOKENS
+    };
+
+    let allOk = true;
+    for (const [name, addr] of Object.entries(addressesToCheck)) {
+        const code = await provider.getCode(addr);
+        if (code === "0x" || code === "0x0") {
+            console.log(`${getTime()} ${C.red}❌ Tidak ada kontrak di alamat ${name} (${addr}). Cek RPC_URL / alamat ini benar untuk network yang sedang dipakai.${C.reset}`);
+            allOk = false;
+        }
+    }
+    if (allOk) {
+        console.log(`${getTime()} ${C.green}✅ Semua alamat kontrak terverifikasi ada di chain ini.${C.reset}`);
+    }
+    return allOk;
+}
+
 async function main() {
     try {
         showBanner();
+
+        const network = await provider.getNetwork();
+        console.log(`${getTime()} ${C.cyan}🌐 Terhubung ke chainId: ${network.chainId}${C.reset}`);
+
+        const contractsOk = await verifyContractsExist();
+        if (!contractsOk) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Lanjut tetap dijalankan, tapi kemungkinan besar akan ada error "missing revert data" pada alamat yang bermasalah di atas.${C.reset}\n`);
+        }
 
         try {
             ROUTER_WETH_ADDRESS = await routerContract.WETH();
