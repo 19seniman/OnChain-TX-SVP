@@ -59,7 +59,6 @@ const TOKENS = {
 const ROUTER_ABI = [
     "function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable",
     "function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external",
-    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
     "function WETH() external view returns (address)"
 ];
 
@@ -99,6 +98,9 @@ async function approveTokenIfNeeded(tokenAddress) {
         const tx = await tokenContract.approve(ROUTER_ADDRESS, ethers.MaxUint256, { gasLimit: 200000 });
         await tx.wait();
         console.log(`${getTime()} ${C.green}✅ Token berhasil di-approve!${C.reset}`);
+        
+        // Jeda ekstra setelah approve agar jaringan testnet sempat memproses datanya
+        await randomDelay(3, 5); 
     }
     return balance;
 }
@@ -114,27 +116,12 @@ async function swapSvpToToken(tokenAddress, tokenName) {
         const amountIn = ethers.parseEther(randomAmount.toString());
         const path = [ROUTER_WETH_ADDRESS, tokenAddress];
 
-        // Mencegah Swap ke diri sendiri
         if (ROUTER_WETH_ADDRESS.toLowerCase() === tokenAddress.toLowerCase()) {
-            console.log(`${getTime()} ${C.yellow}⚠️ Melewati ${tokenName} karena token tujuan sama dengan Base Token Router.${C.reset}`);
-            return false;
-        }
-
-        // PRE-FLIGHT CHECK: Cek apakah pool ada & likuiditas tersedia
-        try {
-            const amounts = await routerContract.getAmountsOut(amountIn, path);
-            if (amounts[1] === 0n) {
-                console.log(`${getTime()} ${C.yellow}⚠️ Likuiditas ${tokenName} di DEX kosong. Swap dilewati agar tidak error.${C.reset}`);
-                return false;
-            }
-        } catch (e) {
-            console.log(`${getTime()} ${C.yellow}⚠️ Pool (Pair) untuk ${tokenName} tidak valid/belum dibuat. Swap dilewati.${C.reset}`);
             return false;
         }
 
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
         
-        // Menggunakan versi SupportingFeeOnTransferTokens agar anti error jika token memiliki pajak
         const tx = await routerContract.swapExactETHForTokensSupportingFeeOnTransferTokens(
             0, path, wallet.address, deadline, { 
             value: amountIn, 
@@ -160,19 +147,6 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
         }
 
         const path = [tokenAddress, ROUTER_WETH_ADDRESS];
-        
-        // PRE-FLIGHT CHECK
-        try {
-            const amounts = await routerContract.getAmountsOut(balance, path);
-            if (amounts[1] === 0n) {
-                console.log(`${getTime()} ${C.yellow}⚠️ Likuiditas balikan dari ${tokenName} ke SVP kosong. Swap dilewati.${C.reset}`);
-                return false;
-            }
-        } catch (e) {
-            console.log(`${getTime()} ${C.yellow}⚠️ Pool tidak dapat memproses kalkulasi swap back. Swap dilewati.${C.reset}`);
-            return false;
-        }
-
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
 
         const tx = await routerContract.swapExactTokensForETHSupportingFeeOnTransferTokens(
