@@ -26,7 +26,7 @@ function showBanner() {
     console.log(C.cyan + C.bright + "╔══════════════════════════════════════════════════════════╗");
     console.log("║                                                          ║");
     console.log("║               🚀 SVP TESTNET AUTO-SWAP 🚀                ║");
-    console.log("║               (Anti-Sybil & Auto 24 Hours)               ║");
+    console.log("║           (Anti-Sybil, Auto-Slippage, 24 Hours)          ║");
     console.log("║                                                          ║");
     console.log("╚══════════════════════════════════════════════════════════╝" + C.reset + "\n");
 }
@@ -57,9 +57,9 @@ const TOKENS = {
 // 2. ABIs
 // ==========================================
 const ROUTER_ABI = [
-    "function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable",
-    "function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external",
-    "function WETH() external view returns (address)"
+    "function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)",
+    "function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)",
+    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"
 ];
 
 const ERC20_ABI = [
@@ -75,8 +75,6 @@ const WSVP_ABI = [
 
 const routerContract = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, wallet);
 const wsvpContract = new ethers.Contract(WSVP_ADDRESS, WSVP_ABI, wallet);
-
-let ROUTER_WETH_ADDRESS = WSVP_ADDRESS; 
 
 // ==========================================
 // 3. FUNGSI UTILITAS & ANTI-SYBIL
@@ -98,15 +96,13 @@ async function approveTokenIfNeeded(tokenAddress) {
         const tx = await tokenContract.approve(ROUTER_ADDRESS, ethers.MaxUint256, { gasLimit: 200000 });
         await tx.wait();
         console.log(`${getTime()} ${C.green}✅ Token berhasil di-approve!${C.reset}`);
-        
-        // Jeda ekstra setelah approve agar jaringan testnet sempat memproses datanya
         await randomDelay(3, 5); 
     }
     return balance;
 }
 
 // ==========================================
-// 4. FUNGSI SWAP UTAMA
+// 4. FUNGSI SWAP UTAMA DENGAN SLIPPAGE
 // ==========================================
 async function swapSvpToToken(tokenAddress, tokenName) {
     try {
@@ -114,18 +110,24 @@ async function swapSvpToToken(tokenAddress, tokenName) {
         console.log(`${getTime()} ${C.blue}🔄 [1/2] Swap ${randomAmount} SVP -> ${tokenName}...${C.reset}`);
 
         const amountIn = ethers.parseEther(randomAmount.toString());
-        const path = [ROUTER_WETH_ADDRESS, tokenAddress];
+        const path = [WSVP_ADDRESS, tokenAddress];
 
-        if (ROUTER_WETH_ADDRESS.toLowerCase() === tokenAddress.toLowerCase()) {
-            return false;
+        // 1. Simulasikan Harga (Slippage Auto-Calculation 10%)
+        let amountOutMin = 0n;
+        try {
+            const amountsOut = await routerContract.getAmountsOut(amountIn, path);
+            amountOutMin = (amountsOut[1] * 90n) / 100n; // Set slippage ke 10%
+        } catch (e) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Gagal cek harga pasar. Menggunakan slippage bebas.${C.reset}`);
         }
 
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
         
-        const tx = await routerContract.swapExactETHForTokensSupportingFeeOnTransferTokens(
-            0, path, wallet.address, deadline, { 
+        // 2. Eksekusi swap standar (seperti Uniswap V2 asli)
+        const tx = await routerContract.swapExactETHForTokens(
+            amountOutMin, path, wallet.address, deadline, { 
             value: amountIn, 
-            gasLimit: 1500000 
+            gasLimit: 2000000 
         });
         await tx.wait();
         console.log(`${getTime()} ${C.green}✅ Sukses (Hash: ${tx.hash})${C.reset}`);
@@ -146,12 +148,23 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
             return false;
         }
 
-        const path = [tokenAddress, ROUTER_WETH_ADDRESS];
+        const path = [tokenAddress, WSVP_ADDRESS];
+        
+        // 1. Simulasikan Harga (Slippage Auto-Calculation 10%)
+        let amountOutMin = 0n;
+        try {
+            const amountsOut = await routerContract.getAmountsOut(balance, path);
+            amountOutMin = (amountsOut[1] * 90n) / 100n; // Set slippage ke 10%
+        } catch (e) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Gagal cek harga pasar balikan. Menggunakan slippage bebas.${C.reset}`);
+        }
+
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
 
-        const tx = await routerContract.swapExactTokensForETHSupportingFeeOnTransferTokens(
-            balance, 0, path, wallet.address, deadline, {
-            gasLimit: 1500000
+        // 2. Eksekusi swap standar
+        const tx = await routerContract.swapExactTokensForETH(
+            balance, amountOutMin, path, wallet.address, deadline, {
+            gasLimit: 2000000
         });
         await tx.wait();
         console.log(`${getTime()} ${C.green}✅ Sukses (Hash: ${tx.hash})${C.reset}`);
@@ -168,13 +181,13 @@ async function handleWsvp() {
         const amountIn = ethers.parseEther(randomAmount.toString());
 
         console.log(`${getTime()} ${C.blue}🔄 Wrap ${randomAmount} SVP -> WSVP...${C.reset}`);
-        const depositTx = await wsvpContract.deposit({ value: amountIn, gasLimit: 100000 });
+        const depositTx = await wsvpContract.deposit({ value: amountIn, gasLimit: 200000 });
         await depositTx.wait();
         
         await randomDelay(10, 20);
 
         console.log(`${getTime()} ${C.blue}🔄 Unwrap All WSVP -> SVP...${C.reset}`);
-        const withdrawTx = await wsvpContract.withdraw(amountIn, { gasLimit: 100000 });
+        const withdrawTx = await wsvpContract.withdraw(amountIn, { gasLimit: 200000 });
         await withdrawTx.wait();
         console.log(`${getTime()} ${C.green}✅ Sukses Wrap/Unwrap SVP!${C.reset}`);
     } catch (error) {
@@ -218,13 +231,7 @@ async function runDailyCycle(loopCount) {
 async function main() {
     try {
         showBanner();
-        
-        try {
-            ROUTER_WETH_ADDRESS = await routerContract.WETH();
-            console.log(`${getTime()} ${C.green}🔗 Terhubung ke Jaringan. Base Route: ${ROUTER_WETH_ADDRESS}${C.reset}\n`);
-        } catch (e) {
-            console.log(`${getTime()} ${C.yellow}⚠️ Gagal mendeteksi Base WETH dari router, menggunakan WSVP default.${C.reset}\n`);
-        }
+        console.log(`${getTime()} ${C.green}🔗 Terhubung ke Jaringan SVP Testnet.${C.reset}\n`);
 
         const answer = await rl.question(`${C.bright}${C.cyan}[?] Berapa kali putaran rute transaksi per harinya? : ${C.reset}`);
         const loopCount = parseInt(answer);
