@@ -16,13 +16,11 @@ const C = {
     cyan: "\x1b[36m"
 };
 
-// Fungsi untuk mendapatkan Waktu Saat Ini
 function getTime() {
     const now = new Date();
     return `${C.magenta}[${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}]${C.reset}`;
 }
 
-// Banner CLI
 function showBanner() {
     console.clear();
     console.log(C.cyan + C.bright + "╔══════════════════════════════════════════════════════════╗");
@@ -46,7 +44,7 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
 const ROUTER_ADDRESS = "0xfe7bf2dfd5cb268c6779f1f614638a436cb701e4";
-const WSVP_ADDRESS = "0x5300000000000000000000000000000000000004"; // WSVP Native
+const WSVP_ADDRESS = "0x5300000000000000000000000000000000000004"; 
 const TOKENS = {
     USDV: "0x013a61E622e6ABFCaB64F52D274C3Fc0aA37f951",
     WETH: "0x1c12dbda863900c680a3836c53d408feaf63f0ba",
@@ -109,7 +107,8 @@ async function approveTokenIfNeeded(tokenAddress) {
 // ==========================================
 async function swapSvpToToken(tokenAddress, tokenName) {
     try {
-        const randomAmount = (Math.random() * (0.005 - 0.001) + 0.001).toFixed(4);
+        // PERUBAHAN: Random antara 0.01 hingga 0.03 SVP
+        const randomAmount = (Math.random() * (0.03 - 0.01) + 0.01).toFixed(4);
         console.log(`${getTime()} ${C.blue}🔄 [1/2] Swap ${randomAmount} SVP -> ${tokenName}...${C.reset}`);
 
         const amountIn = ethers.parseEther(randomAmount.toString());
@@ -134,8 +133,9 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
         console.log(`${getTime()} ${C.blue}🔄 [2/2] Swap All ${tokenName} -> SVP...${C.reset}`);
         const balance = await approveTokenIfNeeded(tokenAddress);
 
-        if (balance < 100000n) { 
-            console.log(`${getTime()} ${C.yellow}⚠️ Saldo ${tokenName} kosong/receh, lewati swap back.${C.reset}`);
+        // Filter Anti-Dust diperketat (hanya memblokir saldo 0)
+        if (balance === 0n) { 
+            console.log(`${getTime()} ${C.yellow}⚠️ Saldo ${tokenName} kosong, lewati swap back.${C.reset}`);
             return false;
         }
 
@@ -156,7 +156,8 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
 
 async function handleWsvp() {
     try {
-        const randomAmount = (Math.random() * (0.005 - 0.001) + 0.001).toFixed(4);
+        // PERUBAHAN: Random antara 0.01 hingga 0.03 SVP
+        const randomAmount = (Math.random() * (0.03 - 0.01) + 0.01).toFixed(4);
         const amountIn = ethers.parseEther(randomAmount.toString());
 
         console.log(`${getTime()} ${C.blue}🔄 Wrap ${randomAmount} SVP -> WSVP...${C.reset}`);
@@ -226,7 +227,6 @@ async function main() {
             process.exit(1);
         }
         
-        // Mulai Siklus
         await runDailyCycle(loopCount);
 
         const SATU_HARI_MS = 24 * 60 * 60 * 1000;
