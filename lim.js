@@ -57,8 +57,9 @@ const TOKENS = {
 // 2. ABIs
 // ==========================================
 const ROUTER_ABI = [
-    "function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)",
-    "function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)",
+    "function swapExactETHForTokensSupportingFeeOnTransferTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable",
+    "function swapExactTokensForETHSupportingFeeOnTransferTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external",
+    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
     "function WETH() external view returns (address)"
 ];
 
@@ -107,17 +108,37 @@ async function approveTokenIfNeeded(tokenAddress) {
 // ==========================================
 async function swapSvpToToken(tokenAddress, tokenName) {
     try {
-        // PERUBAHAN: Random antara 0.01 hingga 0.03 SVP
         const randomAmount = (Math.random() * (0.03 - 0.01) + 0.01).toFixed(4);
         console.log(`${getTime()} ${C.blue}🔄 [1/2] Swap ${randomAmount} SVP -> ${tokenName}...${C.reset}`);
 
         const amountIn = ethers.parseEther(randomAmount.toString());
         const path = [ROUTER_WETH_ADDRESS, tokenAddress];
-        const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
 
-        const tx = await routerContract.swapExactETHForTokens(0, path, wallet.address, deadline, { 
+        // Mencegah Swap ke diri sendiri
+        if (ROUTER_WETH_ADDRESS.toLowerCase() === tokenAddress.toLowerCase()) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Melewati ${tokenName} karena token tujuan sama dengan Base Token Router.${C.reset}`);
+            return false;
+        }
+
+        // PRE-FLIGHT CHECK: Cek apakah pool ada & likuiditas tersedia
+        try {
+            const amounts = await routerContract.getAmountsOut(amountIn, path);
+            if (amounts[1] === 0n) {
+                console.log(`${getTime()} ${C.yellow}⚠️ Likuiditas ${tokenName} di DEX kosong. Swap dilewati agar tidak error.${C.reset}`);
+                return false;
+            }
+        } catch (e) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Pool (Pair) untuk ${tokenName} tidak valid/belum dibuat. Swap dilewati.${C.reset}`);
+            return false;
+        }
+
+        const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
+        
+        // Menggunakan versi SupportingFeeOnTransferTokens agar anti error jika token memiliki pajak
+        const tx = await routerContract.swapExactETHForTokensSupportingFeeOnTransferTokens(
+            0, path, wallet.address, deadline, { 
             value: amountIn, 
-            gasLimit: 3000000 
+            gasLimit: 1500000 
         });
         await tx.wait();
         console.log(`${getTime()} ${C.green}✅ Sukses (Hash: ${tx.hash})${C.reset}`);
@@ -133,17 +154,30 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
         console.log(`${getTime()} ${C.blue}🔄 [2/2] Swap All ${tokenName} -> SVP...${C.reset}`);
         const balance = await approveTokenIfNeeded(tokenAddress);
 
-        // Filter Anti-Dust diperketat (hanya memblokir saldo 0)
         if (balance === 0n) { 
             console.log(`${getTime()} ${C.yellow}⚠️ Saldo ${tokenName} kosong, lewati swap back.${C.reset}`);
             return false;
         }
 
         const path = [tokenAddress, ROUTER_WETH_ADDRESS];
+        
+        // PRE-FLIGHT CHECK
+        try {
+            const amounts = await routerContract.getAmountsOut(balance, path);
+            if (amounts[1] === 0n) {
+                console.log(`${getTime()} ${C.yellow}⚠️ Likuiditas balikan dari ${tokenName} ke SVP kosong. Swap dilewati.${C.reset}`);
+                return false;
+            }
+        } catch (e) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Pool tidak dapat memproses kalkulasi swap back. Swap dilewati.${C.reset}`);
+            return false;
+        }
+
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
 
-        const tx = await routerContract.swapExactTokensForETH(balance, 0, path, wallet.address, deadline, {
-            gasLimit: 3000000
+        const tx = await routerContract.swapExactTokensForETHSupportingFeeOnTransferTokens(
+            balance, 0, path, wallet.address, deadline, {
+            gasLimit: 1500000
         });
         await tx.wait();
         console.log(`${getTime()} ${C.green}✅ Sukses (Hash: ${tx.hash})${C.reset}`);
@@ -156,7 +190,6 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
 
 async function handleWsvp() {
     try {
-        // PERUBAHAN: Random antara 0.01 hingga 0.03 SVP
         const randomAmount = (Math.random() * (0.03 - 0.01) + 0.01).toFixed(4);
         const amountIn = ethers.parseEther(randomAmount.toString());
 
@@ -216,7 +249,7 @@ async function main() {
             ROUTER_WETH_ADDRESS = await routerContract.WETH();
             console.log(`${getTime()} ${C.green}🔗 Terhubung ke Jaringan. Base Route: ${ROUTER_WETH_ADDRESS}${C.reset}\n`);
         } catch (e) {
-            console.log(`${getTime()} ${C.yellow}⚠️ Gagal mendeteksi Base WETH, menggunakan WSVP default.${C.reset}\n`);
+            console.log(`${getTime()} ${C.yellow}⚠️ Gagal mendeteksi Base WETH dari router, menggunakan WSVP default.${C.reset}\n`);
         }
 
         const answer = await rl.question(`${C.bright}${C.cyan}[?] Berapa kali putaran rute transaksi per harinya? : ${C.reset}`);
