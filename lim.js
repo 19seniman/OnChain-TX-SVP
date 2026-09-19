@@ -44,7 +44,7 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 
 const ROUTER_ADDRESS = "0xfe7bf2dfd5cb268c6779f1f614638a436cb701e4";
-const WSVP_ADDRESS = "0x5300000000000000000000000000000000000004"; 
+const WSVP_ADDRESS = "0x5300000000000000000000000000000000000004";
 const TOKENS = {
     USDV: "0x013a61E622e6ABFCaB64F52D274C3Fc0aA37f951",
     WETH: "0x1c12dbda863900c680a3836c53d408feaf63f0ba",
@@ -52,6 +52,13 @@ const TOKENS = {
     WBTC: "0x6c22ceb0852bd7781b57574aaa5de0f22cd44162",
     WBNB: "0x8787384b8640f6e9c30e94585d3d62b03f80a5df"
 };
+
+// Bisa dikonfigurasi lewat .env: SLIPPAGE_PERCENT=10 artinya toleransi 10%
+const SLIPPAGE_PERCENT = BigInt(process.env.SLIPPAGE_PERCENT || "10");
+// Buffer gas tambahan di atas hasil estimateGas (dalam persen)
+const GAS_BUFFER_PERCENT = 30n;
+// Minimal saldo native yang harus tersisa untuk menutupi gas (dalam ETH/SVP)
+const MIN_NATIVE_RESERVE = ethers.parseEther(process.env.MIN_NATIVE_RESERVE || "0.005");
 
 // ==========================================
 // 2. ABIs
@@ -78,7 +85,7 @@ const routerContract = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, wallet);
 const wsvpContract = new ethers.Contract(WSVP_ADDRESS, WSVP_ABI, wallet);
 
 // Default base routing token (akan ditimpa secara otomatis oleh router)
-let ROUTER_WETH_ADDRESS = "0x1c12dbda863900c680a3836c53d408feaf63f0ba"; 
+let ROUTER_WETH_ADDRESS = "0x1c12dbda863900c680a3836c53d408feaf63f0ba";
 
 // ==========================================
 // 3. FUNGSI UTILITAS & ANTI-SYBIL
@@ -89,18 +96,56 @@ async function randomDelay(minSeconds, maxSeconds) {
     return new Promise(resolve => setTimeout(resolve, delay * 1000));
 }
 
+// Ambil pesan revert yang lebih jelas dari sebuah error ethers v6
+function extractRevertReason(error) {
+    if (error?.reason) return error.reason;
+    if (error?.shortMessage) return error.shortMessage;
+    if (error?.info?.error?.message) return error.info.error.message;
+    if (error?.data) {
+        try {
+            const decoded = ethers.toUtf8String('0x' + error.data.slice(138));
+            if (decoded) return decoded;
+        } catch (_) { /* abaikan, gagal decode manual */ }
+    }
+    return error?.message || 'Alasan tidak diketahui (revert tanpa pesan)';
+}
+
+// Simulasikan transaksi dulu (staticCall) sebelum benar-benar mengirimnya.
+// Ini penting supaya kalau bakal revert, kita tahu ALASANNYA dan tidak buang gas.
+async function simulateAndEstimate(contract, method, args, overrides = {}) {
+    try {
+        await contract[method].staticCall(...args, overrides);
+    } catch (error) {
+        return { ok: false, reason: extractRevertReason(error) };
+    }
+
+    try {
+        const estimated = await contract[method].estimateGas(...args, overrides);
+        const gasLimit = (estimated * (100n + GAS_BUFFER_PERCENT)) / 100n;
+        return { ok: true, gasLimit };
+    } catch (error) {
+        // Static call sukses tapi estimateGas gagal (jarang) -> tetap pakai gas limit default aman
+        return { ok: true, gasLimit: 1500000n };
+    }
+}
+
 async function approveTokenIfNeeded(tokenAddress) {
     const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, wallet);
     const balance = await tokenContract.balanceOf(wallet.address);
-    if (balance === 0n) return 0n; 
+    if (balance === 0n) return 0n;
 
     const allowance = await tokenContract.allowance(wallet.address, ROUTER_ADDRESS);
     if (allowance < balance) {
         console.log(`${getTime()} ${C.yellow}🔓 Mengizinkan Router menggunakan token...${C.reset}`);
-        const tx = await tokenContract.approve(ROUTER_ADDRESS, ethers.MaxUint256, { gasLimit: 200000 });
-        await tx.wait();
-        console.log(`${getTime()} ${C.green}✅ Token berhasil di-approve!${C.reset}`);
-        await randomDelay(3, 5); 
+        try {
+            const tx = await tokenContract.approve(ROUTER_ADDRESS, ethers.MaxUint256, { gasLimit: 200000 });
+            await tx.wait();
+            console.log(`${getTime()} ${C.green}✅ Token berhasil di-approve!${C.reset}`);
+            await randomDelay(3, 5);
+        } catch (error) {
+            console.error(`${getTime()} ${C.red}❌ Gagal approve token: ${extractRevertReason(error)}${C.reset}`);
+            return 0n;
+        }
     }
     return balance;
 }
@@ -114,39 +159,48 @@ async function swapSvpToToken(tokenAddress, tokenName) {
         console.log(`${getTime()} ${C.blue}🔄 [1/2] Swap ${randomAmount} SVP -> ${tokenName}...${C.reset}`);
 
         const amountIn = ethers.parseEther(randomAmount.toString());
-        
-        // PERBAIKAN: Menggunakan Base Token resmi Router untuk Path (bukan WSVP)
         const path = [ROUTER_WETH_ADDRESS, tokenAddress];
 
-        // Pencegahan agar tidak menukar Base Token ke Base Token (menghasilkan error)
         if (ROUTER_WETH_ADDRESS.toLowerCase() === tokenAddress.toLowerCase()) {
             console.log(`${getTime()} ${C.yellow}⚠️ Melewati karena ${tokenName} adalah Base Token Router.${C.reset}`);
             return false;
         }
 
-        // 1. Simulasikan Harga (Cek ketersediaan pool)
+        // Cek saldo native cukup (amountIn + cadangan gas)
+        const nativeBalance = await provider.getBalance(wallet.address);
+        if (nativeBalance < amountIn + MIN_NATIVE_RESERVE) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Saldo native tidak cukup untuk swap + gas. Melewati.${C.reset}`);
+            return false;
+        }
+
+        // 1. Cek harga & likuiditas
         let amountOutMin = 0n;
         try {
             const amountsOut = await routerContract.getAmountsOut(amountIn, path);
-            amountOutMin = (amountsOut[amountsOut.length - 1] * 90n) / 100n; // Toleransi Slippage 10%
+            amountOutMin = (amountsOut[amountsOut.length - 1] * (100n - SLIPPAGE_PERCENT)) / 100n;
         } catch (e) {
             console.log(`${getTime()} ${C.yellow}⚠️ Pool likuiditas ${tokenName} tidak ditemukan. Melewati rute ini.${C.reset}`);
-            return false; // Jangan lanjutkan transaksi agar tidak REVERT
+            return false;
         }
 
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
-        
-        // 2. Eksekusi swap
-        const tx = await routerContract.swapExactETHForTokens(
-            amountOutMin, path, wallet.address, deadline, { 
-            value: amountIn, 
-            gasLimit: 2000000 
-        });
+        const args = [amountOutMin, path, wallet.address, deadline];
+        const overrides = { value: amountIn };
+
+        // 2. Simulasikan dulu supaya tahu alasan pasti kalau gagal
+        const sim = await simulateAndEstimate(routerContract, 'swapExactETHForTokens', args, overrides);
+        if (!sim.ok) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Simulasi gagal (${tokenName}): ${sim.reason}. Melewati tanpa kirim tx.${C.reset}`);
+            return false;
+        }
+
+        // 3. Eksekusi swap dengan gas limit hasil estimasi + buffer
+        const tx = await routerContract.swapExactETHForTokens(...args, { ...overrides, gasLimit: sim.gasLimit });
         await tx.wait();
         console.log(`${getTime()} ${C.green}✅ Sukses (Hash: ${tx.hash})${C.reset}`);
         return true;
     } catch (error) {
-        console.error(`${getTime()} ${C.red}❌ Gagal Swap SVP -> ${tokenName}: ${error.reason || error.message}${C.reset}`);
+        console.error(`${getTime()} ${C.red}❌ Gagal Swap SVP -> ${tokenName}: ${extractRevertReason(error)}${C.reset}`);
         return false;
     }
 }
@@ -156,33 +210,37 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
         console.log(`${getTime()} ${C.blue}🔄 [2/2] Swap All ${tokenName} -> SVP...${C.reset}`);
         const balance = await approveTokenIfNeeded(tokenAddress);
 
-        if (balance === 0n) { 
+        if (balance === 0n) {
             console.log(`${getTime()} ${C.yellow}⚠️ Saldo ${tokenName} kosong, lewati swap back.${C.reset}`);
             return false;
         }
 
         const path = [tokenAddress, ROUTER_WETH_ADDRESS];
-        
+
         let amountOutMin = 0n;
         try {
             const amountsOut = await routerContract.getAmountsOut(balance, path);
-            amountOutMin = (amountsOut[amountsOut.length - 1] * 90n) / 100n; // Toleransi Slippage 10%
+            amountOutMin = (amountsOut[amountsOut.length - 1] * (100n - SLIPPAGE_PERCENT)) / 100n;
         } catch (e) {
             console.log(`${getTime()} ${C.yellow}⚠️ Harga balikan gagal dihitung. Melewati rute ini.${C.reset}`);
-            return false; // Jangan lanjutkan transaksi
+            return false;
         }
 
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
+        const args = [balance, amountOutMin, path, wallet.address, deadline];
 
-        const tx = await routerContract.swapExactTokensForETH(
-            balance, amountOutMin, path, wallet.address, deadline, {
-            gasLimit: 2000000
-        });
+        const sim = await simulateAndEstimate(routerContract, 'swapExactTokensForETH', args);
+        if (!sim.ok) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Simulasi gagal (${tokenName} -> SVP): ${sim.reason}. Melewati tanpa kirim tx.${C.reset}`);
+            return false;
+        }
+
+        const tx = await routerContract.swapExactTokensForETH(...args, { gasLimit: sim.gasLimit });
         await tx.wait();
         console.log(`${getTime()} ${C.green}✅ Sukses (Hash: ${tx.hash})${C.reset}`);
         return true;
     } catch (error) {
-        console.error(`${getTime()} ${C.red}❌ Gagal Swap ${tokenName} -> SVP: ${error.reason || error.message}${C.reset}`);
+        console.error(`${getTime()} ${C.red}❌ Gagal Swap ${tokenName} -> SVP: ${extractRevertReason(error)}${C.reset}`);
         return false;
     }
 }
@@ -192,10 +250,16 @@ async function handleWsvp() {
         const randomAmount = (Math.random() * (0.03 - 0.01) + 0.01).toFixed(4);
         const amountIn = ethers.parseEther(randomAmount.toString());
 
+        const nativeBalance = await provider.getBalance(wallet.address);
+        if (nativeBalance < amountIn + MIN_NATIVE_RESERVE) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Saldo native tidak cukup untuk wrap/unwrap. Melewati.${C.reset}`);
+            return;
+        }
+
         console.log(`${getTime()} ${C.blue}🔄 Wrap ${randomAmount} SVP -> WSVP...${C.reset}`);
         const depositTx = await wsvpContract.deposit({ value: amountIn, gasLimit: 200000 });
         await depositTx.wait();
-        
+
         await randomDelay(10, 20);
 
         console.log(`${getTime()} ${C.blue}🔄 Unwrap All WSVP -> SVP...${C.reset}`);
@@ -203,7 +267,7 @@ async function handleWsvp() {
         await withdrawTx.wait();
         console.log(`${getTime()} ${C.green}✅ Sukses Wrap/Unwrap SVP!${C.reset}`);
     } catch (error) {
-        console.error(`${getTime()} ${C.red}❌ Gagal Wrap/Unwrap WSVP: ${error.reason || error.message}${C.reset}`);
+        console.error(`${getTime()} ${C.red}❌ Gagal Wrap/Unwrap WSVP: ${extractRevertReason(error)}${C.reset}`);
     }
 }
 
@@ -225,12 +289,12 @@ async function runDailyCycle(loopCount) {
         for (const key of tokenKeys) {
             const tokenAddr = TOKENS[key];
             console.log(`\n${C.cyan}--- [ Rute: ${key} ] ---${C.reset}`);
-            
+
             await swapSvpToToken(tokenAddr, key);
-            await randomDelay(15, 30); 
-            
+            await randomDelay(15, 30);
+
             await swapTokenToSvp(tokenAddr, key);
-            await randomDelay(15, 30); 
+            await randomDelay(15, 30);
         }
         console.log(`\n${getTime()} ${C.green}${C.bright}✅ PUTARAN ${i} SELESAI!${C.reset}\n`);
     }
@@ -244,7 +308,6 @@ async function main() {
     try {
         showBanner();
 
-        // 1. Deteksi Base Token Route secara dinamis dari Smart Contract
         try {
             ROUTER_WETH_ADDRESS = await routerContract.WETH();
             console.log(`${getTime()} ${C.green}🔗 Terhubung. Base Route Terdeteksi: ${ROUTER_WETH_ADDRESS}${C.reset}\n`);
@@ -259,7 +322,7 @@ async function main() {
             console.log(`${C.red}❌ Masukkan angka yang valid!${C.reset}`);
             process.exit(1);
         }
-        
+
         await runDailyCycle(loopCount);
 
         const SATU_HARI_MS = 24 * 60 * 60 * 1000;
