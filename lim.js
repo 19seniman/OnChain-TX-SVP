@@ -59,7 +59,8 @@ const TOKENS = {
 const ROUTER_ABI = [
     "function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)",
     "function swapExactTokensForETH(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)",
-    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"
+    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)",
+    "function WETH() external view returns (address)"
 ];
 
 const ERC20_ABI = [
@@ -75,6 +76,9 @@ const WSVP_ABI = [
 
 const routerContract = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, wallet);
 const wsvpContract = new ethers.Contract(WSVP_ADDRESS, WSVP_ABI, wallet);
+
+// Default base routing token (akan ditimpa secara otomatis oleh router)
+let ROUTER_WETH_ADDRESS = "0x1c12dbda863900c680a3836c53d408feaf63f0ba"; 
 
 // ==========================================
 // 3. FUNGSI UTILITAS & ANTI-SYBIL
@@ -110,20 +114,29 @@ async function swapSvpToToken(tokenAddress, tokenName) {
         console.log(`${getTime()} ${C.blue}🔄 [1/2] Swap ${randomAmount} SVP -> ${tokenName}...${C.reset}`);
 
         const amountIn = ethers.parseEther(randomAmount.toString());
-        const path = [WSVP_ADDRESS, tokenAddress];
+        
+        // PERBAIKAN: Menggunakan Base Token resmi Router untuk Path (bukan WSVP)
+        const path = [ROUTER_WETH_ADDRESS, tokenAddress];
 
-        // 1. Simulasikan Harga (Slippage Auto-Calculation 10%)
+        // Pencegahan agar tidak menukar Base Token ke Base Token (menghasilkan error)
+        if (ROUTER_WETH_ADDRESS.toLowerCase() === tokenAddress.toLowerCase()) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Melewati karena ${tokenName} adalah Base Token Router.${C.reset}`);
+            return false;
+        }
+
+        // 1. Simulasikan Harga (Cek ketersediaan pool)
         let amountOutMin = 0n;
         try {
             const amountsOut = await routerContract.getAmountsOut(amountIn, path);
-            amountOutMin = (amountsOut[1] * 90n) / 100n; // Set slippage ke 10%
+            amountOutMin = (amountsOut[amountsOut.length - 1] * 90n) / 100n; // Toleransi Slippage 10%
         } catch (e) {
-            console.log(`${getTime()} ${C.yellow}⚠️ Gagal cek harga pasar. Menggunakan slippage bebas.${C.reset}`);
+            console.log(`${getTime()} ${C.yellow}⚠️ Pool likuiditas ${tokenName} tidak ditemukan. Melewati rute ini.${C.reset}`);
+            return false; // Jangan lanjutkan transaksi agar tidak REVERT
         }
 
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
         
-        // 2. Eksekusi swap standar (seperti Uniswap V2 asli)
+        // 2. Eksekusi swap
         const tx = await routerContract.swapExactETHForTokens(
             amountOutMin, path, wallet.address, deadline, { 
             value: amountIn, 
@@ -148,20 +161,19 @@ async function swapTokenToSvp(tokenAddress, tokenName) {
             return false;
         }
 
-        const path = [tokenAddress, WSVP_ADDRESS];
+        const path = [tokenAddress, ROUTER_WETH_ADDRESS];
         
-        // 1. Simulasikan Harga (Slippage Auto-Calculation 10%)
         let amountOutMin = 0n;
         try {
             const amountsOut = await routerContract.getAmountsOut(balance, path);
-            amountOutMin = (amountsOut[1] * 90n) / 100n; // Set slippage ke 10%
+            amountOutMin = (amountsOut[amountsOut.length - 1] * 90n) / 100n; // Toleransi Slippage 10%
         } catch (e) {
-            console.log(`${getTime()} ${C.yellow}⚠️ Gagal cek harga pasar balikan. Menggunakan slippage bebas.${C.reset}`);
+            console.log(`${getTime()} ${C.yellow}⚠️ Harga balikan gagal dihitung. Melewati rute ini.${C.reset}`);
+            return false; // Jangan lanjutkan transaksi
         }
 
         const deadline = Math.floor(Date.now() / 1000) + 60 * 10;
 
-        // 2. Eksekusi swap standar
         const tx = await routerContract.swapExactTokensForETH(
             balance, amountOutMin, path, wallet.address, deadline, {
             gasLimit: 2000000
@@ -231,7 +243,14 @@ async function runDailyCycle(loopCount) {
 async function main() {
     try {
         showBanner();
-        console.log(`${getTime()} ${C.green}🔗 Terhubung ke Jaringan SVP Testnet.${C.reset}\n`);
+
+        // 1. Deteksi Base Token Route secara dinamis dari Smart Contract
+        try {
+            ROUTER_WETH_ADDRESS = await routerContract.WETH();
+            console.log(`${getTime()} ${C.green}🔗 Terhubung. Base Route Terdeteksi: ${ROUTER_WETH_ADDRESS}${C.reset}\n`);
+        } catch (e) {
+            console.log(`${getTime()} ${C.yellow}⚠️ Gagal cek Router WETH, menggunakan default manual.${C.reset}\n`);
+        }
 
         const answer = await rl.question(`${C.bright}${C.cyan}[?] Berapa kali putaran rute transaksi per harinya? : ${C.reset}`);
         const loopCount = parseInt(answer);
